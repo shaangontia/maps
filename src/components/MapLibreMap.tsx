@@ -12,11 +12,10 @@ const DEM_TILEJSON = 'https://demotiles.maplibre.org/terrain-tiles/tiles.json';
 export default function MapLibreMap() {
 	const [viewState, setViewState] = useState<MapViewState>({
 		...INITIAL_VIEW_STATE_GERMANY,
-		// Ensure we start with some pitch/bearing so relief is visible
-		pitch: INITIAL_VIEW_STATE_GERMANY.pitch ?? 70,
-		bearing: INITIAL_VIEW_STATE_GERMANY.bearing ?? -20,
 	});
 	const [selectedMarker, setSelectedMarker] = useState<MapMarker | null>(null);
+	const [isAtAlps, setIsAtAlps] = useState(false);
+	const [terrainStatus, setTerrainStatus] = useState<'loading' | 'loaded' | 'failed'>('loading');
 	const mapRef = useRef<MapRef>(null);
 
 	const handleMarkerClick = useCallback((marker: MapMarker) => {
@@ -27,10 +26,91 @@ export default function MapLibreMap() {
 		setSelectedMarker(null);
 	}, []);
 
+	const handleToggleView = useCallback(() => {
+		const map = mapRef.current?.getMap();
+		if (!map) return;
+
+		if (isAtAlps) {
+			// Go back to initial view
+			map.flyTo({
+				center: [INITIAL_VIEW_STATE_GERMANY.longitude, INITIAL_VIEW_STATE_GERMANY.latitude],
+				zoom: INITIAL_VIEW_STATE_GERMANY.zoom,
+				pitch: INITIAL_VIEW_STATE_GERMANY.pitch,
+				bearing: INITIAL_VIEW_STATE_GERMANY.bearing,
+				duration: 1200,
+			});
+			setIsAtAlps(false);
+		} else {
+			// Go to Alps (Zugspitze)
+			map.flyTo({
+				center: [10.984, 47.421],
+				zoom: 12.5,
+				pitch: 75,
+				bearing: -30,
+				duration: 1200,
+			});
+			setIsAtAlps(true);
+		}
+	}, [isAtAlps]);
+
 	// Add DEM source, sky, and enable terrain after the map loads
 	useEffect(() => {
 		const map = mapRef.current?.getMap();
 		if (!map) return;
+
+		let terrainRetryCount = 0;
+		const maxRetries = 3;
+		let sourceDataHandler: ((e: any) => void) | null = null;
+
+		const enableTerrain = () => {
+			try {
+				// 2) Optional sky for depth cues
+				if (!map.getLayer('sky')) {
+					map.addLayer({
+						id: 'sky',
+						type: 'sky' as any,
+						paint: { 'sky-type': 'atmosphere', 'sky-opacity': 1 } as any,
+					});
+				}
+
+				// 3) Enable terrain
+				map.setTerrain({ source: DEM_SOURCE_ID, exaggeration: 1.5 } as any);
+
+				// 4) Optional: gentle light to enhance relief
+				if (map.setLight) {
+					map.setLight({ anchor: 'viewport', intensity: 0.6 } as any);
+				}
+
+				// 5) Optional: hillshade to make relief visible even from above
+				if (!map.getLayer('hillshade')) {
+					map.addLayer({
+						id: 'hillshade',
+						type: 'hillshade',
+						source: DEM_SOURCE_ID,
+						paint: { 'hillshade-exaggeration': 0.8 },
+					});
+				}
+
+				console.log('Terrain enabled successfully');
+				setTerrainStatus('loaded');
+				
+				// Remove the sourcedata handler once terrain is enabled
+				if (sourceDataHandler) {
+					map.off('sourcedata', sourceDataHandler);
+					sourceDataHandler = null;
+				}
+			} catch (err) {
+				console.error('Error enabling terrain:', err);
+				// Retry terrain setup
+				if (terrainRetryCount < maxRetries) {
+					terrainRetryCount++;
+					console.log(`Retrying terrain setup (${terrainRetryCount}/${maxRetries})...`);
+					setTimeout(() => enableTerrain(), 1000);
+				} else {
+					setTerrainStatus('failed');
+				}
+			}
+		};
 
 		const onLoad = () => {
 			try {
@@ -40,48 +120,41 @@ export default function MapLibreMap() {
 						type: 'raster-dem',
 						url: DEM_TILEJSON,
 						tileSize: 256,
-					} as any);
+					});
 				}
 
-				// 2) Optional sky for depth cues
-				if (!map.getLayer('sky')) {
-					map.addLayer({
-						id: 'sky',
-						type: 'sky',
-						paint: { 'sky-type': 'atmosphere', 'sky-opacity': 1 },
-					} as any);
-				}
+				// Wait for the source to be loaded before setting terrain
+				sourceDataHandler = (e: any) => {
+					if (e.sourceId === DEM_SOURCE_ID && e.isSourceLoaded) {
+						enableTerrain();
+					}
+				};
+				map.on('sourcedata', sourceDataHandler);
 
-				// 3) Enable terrain
-				map.setTerrain({ source: DEM_SOURCE_ID, exaggeration: 1.8 } as any);
-
-				// 4) Optional: gentle light to enhance relief
-				map.setLight?.({ anchor: 'viewport', intensity: 0.6 } as any);
-
-				// 5) Ensure camera has enough pitch (in case initial state had none)
-				map.easeTo({ pitch: 70, bearing: -20, duration: 0 });
-
-				// 6) Optional: hillshade to make relief visible even from above
-				if (!map.getLayer('hillshade')) {
-					map.addLayer(
-						{
-							id: 'hillshade',
-							type: 'hillshade',
-							source: DEM_SOURCE_ID,
-							paint: { 'hillshade-exaggeration': 0.6 },
-						} as any,
-						/* insert before labels if desired */ undefined
-					);
-				}
+				// Fallback: Try to enable terrain after a delay even if sourcedata doesn't fire
+				setTimeout(() => {
+					if (map.getSource(DEM_SOURCE_ID) && !map.getTerrain()) {
+						console.log('Fallback terrain initialization...');
+						enableTerrain();
+					}
+				}, 3000);
 
 				// (Optional) Quick sanity probe once tiles are idle:
 				map.once('idle', () => {
-					const elev = (map as any).queryTerrainElevation?.([10.984, 47.421]); // Zugspitze
+					const elev = map.queryTerrainElevation?.([10.984, 47.421]); // Zugspitze
 					// Should log a number (not null) if DEM tile loaded
 					console.log('Sample terrain elevation (Zugspitze):', elev);
+					
+					// If terrain still not working, try one more time
+					if (!elev && terrainRetryCount < maxRetries) {
+						console.log('Terrain not detected, attempting final retry...');
+						setTimeout(() => enableTerrain(), 1000);
+					} else if (!elev) {
+						setTerrainStatus('failed');
+					}
 				});
 			} catch (err) {
-				console.error('Error enabling terrain:', err);
+				console.error('Error in terrain setup:', err);
 			}
 		};
 
@@ -90,6 +163,9 @@ export default function MapLibreMap() {
 
 		return () => {
 			map.off('load', onLoad);
+			if (sourceDataHandler) {
+				map.off('sourcedata', sourceDataHandler);
+			}
 		};
 	}, []);
 
@@ -115,15 +191,36 @@ export default function MapLibreMap() {
 					>
 						<div
 							style={{
-								backgroundColor: '#ff6b6b',
-								width: 20,
-								height: 20,
+								backgroundColor: marker.title.includes('Zugspitze') || marker.title.includes('Berchtesgaden') || marker.title.includes('Black Forest') ? '#4CAF50' : '#ff6b6b',
+								width: 24,
+								height: 24,
 								borderRadius: '50%',
-								border: '2px solid white',
+								border: '3px solid white',
 								cursor: 'pointer',
-								boxShadow: '0 2px 4px rgba(0,0,0,0.3)',
+								boxShadow: '0 4px 8px rgba(0,0,0,0.4)',
+								display: 'flex',
+								alignItems: 'center',
+								justifyContent: 'center',
+								fontSize: '12px',
+								color: 'white',
+								fontWeight: 'bold',
+								transition: 'all 0.2s ease',
 							}}
-						/>
+							onMouseEnter={(e) => {
+								e.currentTarget.style.transform = 'scale(1.2)';
+								e.currentTarget.style.zIndex = '1000';
+							}}
+							onMouseLeave={(e) => {
+								e.currentTarget.style.transform = 'scale(1)';
+								e.currentTarget.style.zIndex = 'auto';
+							}}
+						>
+							{marker.title.includes('Zugspitze') ? '🏔️' : 
+							 marker.title.includes('Berchtesgaden') ? '🏞️' : 
+							 marker.title.includes('Black Forest') ? '🌲' : 
+							 marker.title.includes('Berlin') ? '🏛️' :
+							 marker.title.includes('Düsseldorf') ? '🏢' : '⛪'}
+						</div>
 					</Marker>
 				))}
 
@@ -141,20 +238,9 @@ export default function MapLibreMap() {
 				)}
 			</Map>
 
-			{/* Optional: a tiny debug button to prove 3D instantly */}
+			{/* Toggle button to switch between Alps and initial view */}
 			<button
-				onClick={() => {
-					const map = mapRef.current?.getMap();
-					if (!map) return;
-					// Fly to the Alps (Zugspitze) so the relief is obvious
-					map.flyTo({
-						center: [10.984, 47.421],
-						zoom: 12.5,
-						pitch: 75,
-						bearing: -30,
-						duration: 1200,
-					});
-				}}
+				onClick={handleToggleView}
 				style={{
 					position: 'absolute',
 					top: 10,
@@ -163,12 +249,35 @@ export default function MapLibreMap() {
 					padding: '8px 12px',
 					borderRadius: 6,
 					border: '1px solid #ddd',
-					background: 'white',
 					cursor: 'pointer',
+					backgroundColor: isAtAlps ? '#4CAF50' : 'white',
+					color: isAtAlps ? 'white' : 'black',
+					transition: 'all 0.2s ease',
 				}}
 			>
-				🏔️ Go to Alps
+				{isAtAlps ? '🏠 Back to Overview' : '🏔️ Go to Alps'}
 			</button>
+
+			{/* Terrain status indicator */}
+			{terrainStatus !== 'loaded' && (
+				<div
+					style={{
+						position: 'absolute',
+						top: 10,
+						left: 10,
+						zIndex: 1000,
+						padding: '8px 12px',
+						borderRadius: 6,
+						backgroundColor: terrainStatus === 'loading' ? '#2196F3' : '#f44336',
+						color: 'white',
+						fontSize: '14px',
+						fontWeight: 'bold',
+						boxShadow: '0 2px 4px rgba(0,0,0,0.3)',
+					}}
+				>
+					{terrainStatus === 'loading' ? '⏳ Loading Terrain...' : '⚠️ Terrain Failed'}
+				</div>
+			)}
 		</div>
 	);
 }
